@@ -1,67 +1,296 @@
 name: DevSecOps CI/CD Pipeline
 
 on:
-    push:
-        branches: ["main", "master"]
-    pull_request:
-        branches: ["main", "master"]
-    workflow_dispatch: {}
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch: {}
 
 jobs:
-    # ==========================================
-    # CI JOB 1: SAST Scan (Semgrep)
-    # ==========================================
-    sast-scan:
-        name: Semgrep SAST Scan
-        runs-on: ubuntu-latest
-        container:
-            image: semgrep/semgrep
-        steps:
-            - name: Checkout Source Code
-              uses: actions/checkout@v4
+  sast-scan:
+    name: Semgrep SAST Scan
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
 
-            - name: Run Semgrep SAST
-              # --exclude=".github" mencegah Semgrep memeriksa file workflow YAML
-              run: semgrep scan --config auto --error --verbose --exclude=".github"
+      - name: Run Semgrep SAST
+        run: semgrep scan --config auto --error --verbose --exclude=".github"
 
-    # ==========================================
-    # CI JOB 2: Code Quality (Pylint)
-    # ==========================================
-    pylint-check:
-        name: Pylint Code Quality Gate
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout Source Code
-              uses: actions/checkout@v4
+  pylint-check:
+    name: Pylint Code Quality Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
 
-            - name: Setup Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: "3.10"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
 
-            - name: Install Dependencies
-              run: |
-                  python -m pip install --upgrade pip
-                  pip install pylint
-                  pip install -r requirements.txt
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pylint
+          pip install -r requirements.txt
 
-            - name: Run Pylint Check
-              run: pylint --fail-under=9.0 app.py
+      - name: Run Pylint Check
+        run: pylint --fail-under=9.0 app.py
 
-    # ==========================================
-    # CD STAGE: Deploy ke VM
-    # ==========================================
-    deploy-to-vm:
-        name: Build & Deploy to VirtualBox VM
-        needs: [sast-scan, pylint-check]
-        runs-on: self-hosted
-        steps:
-            - name: Checkout Source Code
-              uses: actions/checkout@v4
-            - name: Build and Run Container
-              run: |
-                  docker build -t secure-flask-app:latest .
-                  docker stop web-flask || true
-                  docker rm web-flask || true
-                  docker run -d -p 5000:5000 --name web-flask secure-flask-app:latest
-                  docker ps | grep web-flask
+  deploy-to-vm:
+    name: Build & Deploy to VirtualBox VM
+    needs: [sast-scan, pylint-check]
+    if: >-
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.ref == 'refs/heads/main' ||
+       github.ref == 'refs/heads/master')
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t "secure-flask-app:${GITHUB_SHA}" .
+
+      - name: Prepare Persistent Volume
+        run: |
+          docker volume create group-flask-production-data
+
+      - name: Test New Container
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          IMAGE="secure-flask-app:${GITHUB_SHA}"
+          CANDIDATE_VOLUME="group-flask-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cleanup_candidate() {
+            docker rm -f web-flask-candidate >/dev/null 2>&1 || true
+            docker volume rm "$CANDIDATE_VOLUME" >/dev/null 2>&1 || true
+          }
+          trap cleanup_candidate EXIT
+
+          docker rm -f web-flask-candidate 2>/dev/null || true
+          docker volume create "$CANDIDATE_VOLUME" >/dev/null
+
+          docker run -d \
+            --name web-flask-candidate \
+            -e DATABASE_PATH=/app/data/users.db \
+            -v "$CANDIDATE_VOLUME:/app/data" \
+            "$IMAGE"
+
+          HEALTH=""
+
+          attempt=0
+          while [ "$attempt" -lt 30 ]; do
+            HEALTH=$(docker inspect \
+              --format='{{.State.Health.Status}}' \
+              web-flask-candidate 2>/dev/null || true)
+
+            if [ "$HEALTH" = "healthy" ]; then
+              break
+            fi
+
+            if [ "$HEALTH" = "unhealthy" ]; then
+              docker logs web-flask-candidate
+              docker rm -f web-flask-candidate
+              exit 1
+            fi
+
+            sleep 2
+            attempt=$((attempt + 1))
+          done
+
+          if [ "$HEALTH" != "healthy" ]; then
+            docker logs web-flask-candidate
+            docker rm -f web-flask-candidate
+            echo "Candidate container gagal health check."
+            exit 1
+          fi
+
+          docker rm -f web-flask-candidate
+
+      - name: Deploy Application
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          IMAGE="secure-flask-app:${GITHUB_SHA}"
+          BACKUP_CONTAINER="web-flask-previous"
+          VOLUME="group-flask-production-data"
+          OLD_CONTAINER_PRESENT=false
+
+          docker image inspect "$IMAGE" >/dev/null
+          docker volume inspect "$VOLUME" >/dev/null
+
+          # Periksa container aktif.
+          if docker inspect web-flask >/dev/null 2>&1; then
+            CURRENT_HEALTH=$(docker inspect \
+              --format='{{if .State.Running}}{{.State.Health.Status}}{{else}}not-running{{end}}' \
+              web-flask)
+
+            if [ "$CURRENT_HEALTH" != "healthy" ]; then
+              echo "Container aktif tidak healthy. Deployment dibatalkan."
+              exit 1
+            fi
+
+            # Pastikan cadangan sebelumnya tidak sedang berjalan.
+            if docker inspect "$BACKUP_CONTAINER" >/dev/null 2>&1; then
+              BACKUP_RUNNING=$(docker inspect \
+                --format='{{.State.Running}}' "$BACKUP_CONTAINER")
+
+              if [ "$BACKUP_RUNNING" = "true" ]; then
+                echo "Container cadangan masih berjalan. Deployment dibatalkan."
+                exit 1
+              fi
+
+              docker rm "$BACKUP_CONTAINER"
+            fi
+
+            echo "Menyimpan container lama..."
+            docker stop web-flask
+            docker rename web-flask "$BACKUP_CONTAINER"
+            OLD_CONTAINER_PRESENT=true
+
+          elif docker inspect "$BACKUP_CONTAINER" >/dev/null 2>&1; then
+            echo "Container aktif tidak ada, tetapi cadangan tersedia."
+            echo "Deployment dibatalkan untuk melindungi cadangan."
+            exit 1
+          fi
+
+          rollback() {
+            echo "Menjalankan rollback..."
+
+            if docker inspect web-flask >/dev/null 2>&1; then
+              RUNNING_IMAGE=$(docker inspect \
+                --format='{{.Config.Image}}' web-flask)
+
+              if [ "$RUNNING_IMAGE" = "$IMAGE" ]; then
+                docker rm -f web-flask
+              fi
+            fi
+
+            if [ "$OLD_CONTAINER_PRESENT" = "true" ]; then
+              docker rename "$BACKUP_CONTAINER" web-flask
+              docker start web-flask
+
+              ROLLBACK_HEALTH=""
+
+              for attempt in $(seq 1 30); do
+                ROLLBACK_HEALTH=$(docker inspect \
+                  --format='{{.State.Health.Status}}' \
+                  web-flask 2>/dev/null || true)
+
+                if [ "$ROLLBACK_HEALTH" = "healthy" ]; then
+                  break
+                fi
+
+                sleep 2
+              done
+
+              if [ "$ROLLBACK_HEALTH" = "healthy" ]; then
+                echo "Rollback berhasil."
+              else
+                echo "PERINGATAN: Rollback belum healthy."
+                docker logs web-flask || true
+              fi
+            else
+              echo "Tidak tersedia container lama untuk rollback."
+            fi
+          }
+
+          echo "Menjalankan image: $IMAGE"
+
+          if ! docker run -d \
+            --name web-flask \
+            --restart unless-stopped \
+            -p 5002:5000 \
+            -e DATABASE_PATH=/app/data/users.db \
+            -v "$VOLUME:/app/data" \
+            "$IMAGE"; then
+
+            echo "Gagal menjalankan container baru."
+            rollback
+            exit 1
+          fi
+
+          HEALTH=""
+
+          for attempt in $(seq 1 30); do
+            HEALTH=$(docker inspect \
+              --format='{{.State.Health.Status}}' \
+              web-flask 2>/dev/null || true)
+
+            echo "Health check $attempt: $HEALTH"
+
+            if [ "$HEALTH" = "healthy" ]; then
+              break
+            fi
+
+            if [ "$HEALTH" = "unhealthy" ]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ "$HEALTH" != "healthy" ]; then
+            echo "Container baru gagal health check."
+            docker logs web-flask || true
+            rollback
+            exit 1
+          fi
+
+          # Verifikasi endpoint setelah deployment.
+          echo "Memeriksa endpoint aplikasi..."
+
+          if ! curl -fsS http://127.0.0.1:5002/health >/dev/null; then
+            echo "Endpoint health gagal."
+            rollback
+            exit 1
+          fi
+
+          if ! curl -fsS http://127.0.0.1:5002/ >/dev/null; then
+            echo "Halaman login gagal."
+            rollback
+            exit 1
+          fi
+
+          LOGIN_RESPONSE=$(curl -fsS -X POST \
+            --data-urlencode "username=admin" \
+            --data-urlencode "password=supersecret" \
+            http://127.0.0.1:5002/)
+
+          if [[ "$LOGIN_RESPONSE" != *"Login Berhasil"* ]]; then
+            echo "Pengujian login gagal."
+            rollback
+            exit 1
+          fi
+
+          DASHBOARD_RESPONSE=$(curl -fsS http://127.0.0.1:5002/dashboard)
+
+          if [[ "$DASHBOARD_RESPONSE" != *"Selamat Datang di Dashboard Baru!"* ]]; then
+            echo "Pengujian dashboard gagal."
+            rollback
+            exit 1
+          fi
+
+          echo "Semua endpoint berhasil diverifikasi."
+          echo "Deployment berhasil."
+          echo "Image aktif: $IMAGE"
+          echo "Volume: $VOLUME"
+          echo "Port: 5002"
+
+          if [ "$OLD_CONTAINER_PRESENT" = "true" ]; then
+            echo "Cadangan: $BACKUP_CONTAINER"
+          fi
+
+          docker ps --filter "name=web-flask"
